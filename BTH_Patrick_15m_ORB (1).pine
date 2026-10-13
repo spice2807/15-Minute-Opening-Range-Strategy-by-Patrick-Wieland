@@ -1,0 +1,420 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Backtest the Hype
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  Patrick Wieland — "Simple Day Trading Strategy for Market Open! 15 MINUTE RANGE!"
+//  coded by Backtest the Hype · v2.3
+//  VISUALIZER (draws every setup and simulates the trades on the loaded history).
+//  The MT5 EA will be the real backtest engine. Use the 1-MINUTE chart of
+//  NASDAQ (NQ / NAS100 / QQQ) or the S&P 500 (ES / US500 / SPY).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  HIS RULES (stated in the video)
+//   1. Opening range = the FIRST 15-MINUTE CANDLE of the cash session, 9:30-9:45 New York.
+//      Mark its high and its low.
+//   2. Nothing to do inside the range. No trade until that 15-minute candle has closed,
+//      and no trade while price is still inside it ("there's nothing to do in there").
+//   3. Break above the high  -> look only for LONGS.
+//      Break below the low   -> look only for SHORTS.
+//      Once it breaks one side he stays with that side ("all day I'm looking for those shorts").
+//   4. Entry on the 1/3/5-minute chart in the break direction.
+//   5. Stop = the high of the candle he shorts on (low of the candle for longs).
+//      Size the position to that stop.
+//   6. No fixed target: ride the move and keep moving the stop to each new
+//      lower high (shorts) / higher low (longs). "20-30 points a day, risking 10."
+//   7. If economic numbers come out at 9:45 or 10:00, wait for them before trading.
+//
+//  OUR DEFINITIONS — our mechanical reading of his idea, NOT rules he stated. All are settings.
+//   - A break = a candle CLOSES beyond the range (default: 1-minute candle).
+//     A wick through the level is not a break.
+//   - Entry = the OPEN of the candle after the breakout candle closes, plus slippage
+//     (option: the breakout candle's close, which is optimistic).
+//     Stop = the breakout candle's opposite extreme.
+//     Option: stop on the other side of the range, or at the range midpoint (classic ORB).
+//   - Trailing stop = each new confirmed swing (2 bars each side, ties don't count). A swing is only
+//     known when its last bar closes, so the new stop is live from the NEXT candle.
+//     The stop only ever moves in the trade's favour.
+//   - Exit styles: TRAIL (his description) · FIXED R:R · TRAIL + R:R cap.
+//   - Entries allowed from 9:45 to 12:00 New York. Every trade is closed by 15:55.
+//   - One trade at a time. Max trades per day is a setting (default 1).
+//     A re-entry needs price to close back inside the range and break out again.
+//   - Direction is locked by the first break after the range closes (default), even if
+//     entries are delayed to 10:00 for news. Option: either side, each break.
+//   - Entry = a FRESH break only: the previous candle closed inside the range and this one
+//     closes outside. If price is already outside when entries open (e.g. news delay), we
+//     wait for it to come back inside and break again. Option: any close beyond the range.
+//   - News: Pine can't read an economic calendar. "Wait until 10:00" is a manual switch.
+//   - Same-candle stop and target: we count the STOP (worst case).
+//   - Costs: slippage on every market fill (entry, stop, close-out), commission per trade.
+//     Targets are limit orders, so no slippage on them.
+//   - A trade that closes at exactly 0R is a break-even: not a win, not a loss.
+//   - 1-MINUTE CHART ONLY. The 5m/15m confirmation is built from 1-minute candles.
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+indicator("Backtest the Hype — Patrick 15m Opening Range", shorttitle = "BTH 15m ORB", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ───────────── Inputs ─────────────
+grpT = "Session (New York time)"
+tz         = input.string("America/New_York", "Timezone", options = ["America/New_York", "Africa/Lagos", "Europe/London", "UTC"], group = grpT, tooltip = "Leave on America/New_York so the times never need changing (it handles the US clock change).")
+openHHMM   = input.int(930, "Session open (HHMM)", minval = 0, maxval = 2359, group = grpT)
+orMinutes  = input.int(15, "Opening range length (minutes)", minval = 1, maxval = 120, group = grpT, tooltip = "His video: the first 15-minute candle (9:30-9:45).")
+startHHMM  = input.int(945, "Earliest entry (HHMM)", minval = 0, maxval = 2359, group = grpT, tooltip = "9:45 = right after the range candle closes. Set 1000 on days with 10:00 news (his rule: wait for the numbers).")
+lastHHMM   = input.int(1200, "Last entry (HHMM)", minval = 0, maxval = 2359, group = grpT)
+flatHHMM   = input.int(1555, "Close every trade by (HHMM)", minval = 0, maxval = 2359, group = grpT)
+
+grpE = "Entry"
+confirmTF  = input.string("Chart candle (1-minute)", "Break confirmed by", options = ["Chart candle (1-minute)", "5-minute candle close", "15-minute candle close"], group = grpE, tooltip = "A break only counts when a candle of this size CLOSES beyond the range.")
+dirMode    = input.string("Locked by the first break", "Direction for the day", options = ["Locked by the first break", "Either side (each break)"], group = grpE)
+dirFrom    = input.string("First break after the range", "First break counted from", options = ["First break after the range", "First break after earliest entry"], group = grpE, tooltip = "After the range (default): a 9:50 break sets the direction even if you wait until 10:00 to trade. After earliest entry: breaks before your entry time are ignored.")
+freshOnly  = input.string("Fresh break only", "Entry candle", options = ["Fresh break only", "Any close beyond the range"], group = grpE, tooltip = "Fresh break: the previous candle closed inside the range and this one closes outside. Matters when entries are delayed (news) and price is already outside the range at the entry time.")
+maxTradesI = input.int(1, "Max trades per day", minval = 1, maxval = 10, group = grpE)
+
+grpS = "Stop & exit"
+stopMode   = input.string("Breakout candle extreme (his)", "Stop", options = ["Breakout candle extreme (his)", "Other side of the range", "Range midpoint"], group = grpS)
+exitMode   = input.string("Trail swings (his)", "Exit style", options = ["Trail swings (his)", "Fixed R:R", "Trail + R:R cap"], group = grpS)
+rr         = input.float(2.0, "R:R target (Fixed / cap)", minval = 0.5, step = 0.25, group = grpS)
+pivLen     = input.int(2, "Swing size for trailing (bars each side)", minval = 1, maxval = 10, group = grpS)
+
+grpC = "Fills & costs"
+fillMode   = input.string("Next candle open (realistic)", "Entry fill", options = ["Next candle open (realistic)", "Breakout candle close (optimistic)"], group = grpC, tooltip = "You only know the break once the candle has closed, so the first price you can really get is the next candle's open.")
+slipPts    = input.float(0.25, "Slippage per market fill (points)", minval = 0, step = 0.05, group = grpC, tooltip = "NQ / NAS100 about 0.25-0.5 · ES / US500 about 0.25 · QQQ / SPY about 0.01-0.02.")
+commPts    = input.float(0.0, "Commission + spread per trade (points)", minval = 0, step = 0.05, group = grpC, tooltip = "Your broker's round-trip cost in index points. On CFDs, put the spread here.")
+
+grpV = "Visuals"
+showBox    = input.bool(true, "Show opening range", group = grpV)
+showTrades = input.bool(true, "Show trades", group = grpV)
+showPanel  = input.bool(true, "Show results panel", group = grpV)
+
+cGreen = #00E561
+cRed   = #FF4D5E
+cGrey  = #7E918A
+cWhite = #EEF4F0
+cPanel = #0B1410
+cAmber = #F5B942
+
+// ───────────── Helpers ─────────────
+toMin(hhmm) => math.floor(hhmm / 100) * 60 + hhmm % 100
+openM  = toMin(openHHMM)
+orEndM = openM + orMinutes
+startM = math.max(toMin(startHHMM), orEndM)
+lastM  = toMin(lastHHMM)
+flatM  = toMin(flatHHMM)
+detM   = dirFrom == "First break after the range" ? orEndM : startM
+tfMin  = timeframe.isminutes ? timeframe.multiplier : timeframe.isseconds ? 1 : 1440
+okTF   = timeframe.isminutes and timeframe.multiplier == 1   // 1-minute chart only
+nextOpen = fillMode == "Next candle open (realistic)"
+
+mOpen  = hour(time, tz) * 60 + minute(time, tz)   // bar open, minutes since midnight (New York)
+mClose = mOpen + tfMin                              // bar close
+newDay = nz(ta.change(dayofmonth(time, tz)), 1) != 0
+
+blockN = confirmTF == "5-minute candle close" ? 5 : confirmTF == "15-minute candle close" ? 15 : tfMin
+blockStart = mOpen % blockN == 0
+blockEnd   = mClose % blockN == 0
+
+// trailing swings: strictly higher / lower than the pivLen bars on each side (ties don't count).
+// Same definition as the MT5 EA, so both find the same swings.
+swingHigh() =>
+    bool ok = bar_index >= 2 * pivLen
+    if ok
+        for i = 0 to 2 * pivLen
+            if i != pivLen and high[i] >= high[pivLen]
+                ok := false
+    ok
+swingLow() =>
+    bool ok = bar_index >= 2 * pivLen
+    if ok
+        for i = 0 to 2 * pivLen
+            if i != pivLen and low[i] <= low[pivLen]
+                ok := false
+    ok
+pH = swingHigh() ? high[pivLen] : na
+pL = swingLow() ? low[pivLen] : na
+
+// ───────────── State ─────────────
+var float orH = na
+var float orL = na
+var bool  orDone = false
+var int   dayDir = 0            // 0 = not broken yet, 1 = longs only, -1 = shorts only
+var int   tradesToday = 0
+var bool  needReset = false     // after a trade, price must close back inside before a re-entry
+var float bH = na               // running high/low of the confirmation candle
+var float bL = na
+
+var int   pos = 0               // 1 long, -1 short, 0 flat
+var float ent = na
+var float stp = na
+var float tgt = na
+var float risk = na
+var int   entBar = na
+var line  lStop = na            // current segment of the (trailing) stop line
+var box   rBox = na             // painted risk zone: entry -> first stop
+var box   gBox = na             // painted reward zone: entry -> target, or entry -> best price (trail)
+var float best = na             // best price reached since entry
+var float stop0 = na            // first stop (the risk the trade was sized on)
+var box   orBox = na
+var int   pend = 0              // signal waiting for the next candle's open
+var float pendStop = na
+var float prevBC = na           // close of the previous confirmation candle
+
+// stats
+var int   nT = 0
+var int   nW = 0
+var int   nBE = 0
+var float sumR = 0.0
+var float grossW = 0.0
+var float grossL = 0.0
+var float pts = 0.0
+var int   consec = 0
+var int   maxConsec = 0
+var float eqR = 0.0
+var float peakR = 0.0
+var float maxDD = 0.0
+var int   nDays = 0
+var int   nBreakDays = 0
+
+// result of a trade after commission; px already includes exit slippage
+closeTrade(float px, string why) =>
+    p = (pos == 1 ? px - ent : ent - px) - commPts
+    r = p / risk
+    [r, p, why]
+
+// open a trade (entry price already includes slippage)
+openTrade(int d, float e, float s) =>
+    rk = d == 1 ? e - s : s - e
+    rk > syminfo.mintick ? rk : na
+
+// entry markers, painted like TradingView's long/short position tool.
+// returns [stop line, risk box, reward box]
+drawEntry(int d, float e, float s, float t) =>
+    label.new(bar_index, d == 1 ? low : high, d == 1 ? "LONG" : "SHORT", style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(d == 1 ? cGreen : cRed, 10), textcolor = color.black, size = size.small)
+    rb = box.new(bar_index, d == 1 ? e : s, bar_index + 1, d == 1 ? s : e, border_color = color.new(cRed, 30), bgcolor = color.new(cRed, 78), text = "Stop  " + str.tostring(s, format.mintick), text_size = size.tiny, text_color = cRed, text_halign = text.align_right, text_valign = d == 1 ? text.align_bottom : text.align_top)
+    gTop = na(t) ? e : (d == 1 ? t : e)
+    gBot = na(t) ? e : (d == 1 ? e : t)
+    gTxt = na(t) ? "Trailing" : "Target  " + str.tostring(t, format.mintick) + "  ·  1:" + str.tostring(rr, "#.##")
+    gb = box.new(bar_index, gTop, bar_index + 1, gBot, border_color = color.new(cGreen, 30), bgcolor = color.new(cGreen, 78), text = gTxt, text_size = size.tiny, text_color = cGreen, text_halign = text.align_right, text_valign = d == 1 ? text.align_top : text.align_bottom)
+    ls = line.new(bar_index, s, bar_index + 1, s, color = cRed, width = 2)
+    [ls, rb, gb]
+
+// ───────────── New day ─────────────
+if newDay
+    orH := na
+    orL := na
+    orDone := false
+    dayDir := 0
+    tradesToday := 0
+    needReset := false
+    pend := 0
+    prevBC := na
+    nDays += 1
+
+// ───────────── Opening range ─────────────
+inOR = mOpen >= openM and mOpen < orEndM
+if inOR
+    orH := na(orH) ? high : math.max(orH, high)
+    orL := na(orL) ? low : math.min(orL, low)
+if inOR and showBox and mOpen == openM
+    orBox := box.new(bar_index, high, bar_index, low, border_color = color.new(cWhite, 40), bgcolor = color.new(cWhite, 92), border_width = 1)
+if inOR and showBox and not na(orBox)
+    box.set_top(orBox, orH)
+    box.set_bottom(orBox, orL)
+    box.set_right(orBox, bar_index)
+if not orDone and not na(orH) and mOpen >= orEndM
+    orDone := true
+if orDone and showBox and not na(orBox) and mOpen < flatM
+    box.set_right(orBox, bar_index)
+
+// running high/low of the confirmation candle
+if blockStart or na(bH)
+    bH := high
+    bL := low
+else
+    bH := math.max(bH, high)
+    bL := math.min(bL, low)
+
+// ───────────── Fill a waiting entry at this candle's open ─────────────
+if pend != 0
+    eP = pend == 1 ? open + slipPts : open - slipPts
+    rkP = openTrade(pend, eP, pendStop)
+    if not na(rkP)            // skipped if the open has already gapped through the stop
+        pos := pend
+        ent := eP
+        stp := pendStop
+        risk := rkP
+        entBar := bar_index - 1   // the breakout candle, so this candle is already managed
+        tgt := exitMode == "Trail swings (his)" ? na : (pend == 1 ? eP + rr * rkP : eP - rr * rkP)
+        best := eP
+        stop0 := pendStop
+        if showTrades
+            [ls1, rb1, gb1] = drawEntry(pend, eP, stp, tgt)
+            lStop := ls1
+            rBox := rb1
+            gBox := gb1
+    pend := 0
+
+// ───────────── Manage open trade ─────────────
+float exitPx = na
+string exitWhy = ""
+if pos != 0 and bar_index > entBar
+    // 1) stop / target against the stop that was live when this candle opened
+    if pos == 1
+        if low <= stp
+            exitPx := math.min(open, stp) - slipPts
+            exitWhy := "stop"
+        else if not na(tgt) and high >= tgt
+            exitPx := math.max(open, tgt)
+            exitWhy := "target"
+    else
+        if high >= stp
+            exitPx := math.max(open, stp) + slipPts
+            exitWhy := "stop"
+        else if not na(tgt) and low <= tgt
+            exitPx := math.min(open, tgt)
+            exitWhy := "target"
+    if na(exitPx) and newDay
+        exitPx := close[1] - pos * slipPts
+        exitWhy := "close"
+    if na(exitPx) and mClose >= flatM
+        exitPx := close - pos * slipPts
+        exitWhy := "close"
+    // best price reached (up to the exit price on the exit candle)
+    best := pos == 1 ? math.max(best, na(exitPx) ? high : math.min(high, math.max(exitPx, ent))) : math.min(best, na(exitPx) ? low : math.max(low, math.min(exitPx, ent)))
+    // 2) a swing that confirmed on THIS candle's close moves the stop for the NEXT candle
+    trail = exitMode != "Fixed R:R"
+    float newStp = na
+    if na(exitPx) and trail and pos == 1 and not na(pL) and bar_index - pivLen > entBar and pL > stp and pL < close
+        newStp := pL
+    if na(exitPx) and trail and pos == -1 and not na(pH) and bar_index - pivLen > entBar and pH < stp and pH > close
+        newStp := pH
+    if showTrades
+        if not na(lStop)
+            line.set_x2(lStop, bar_index)
+        box.set_right(rBox, bar_index)
+        box.set_right(gBox, bar_index)
+        if exitMode == "Trail swings (his)"
+            box.set_top(gBox, pos == 1 ? best : ent)
+            box.set_bottom(gBox, pos == 1 ? ent : best)
+            box.set_text(gBox, "Ran  +" + str.tostring(math.abs(best - ent) / risk, "#.#") + "R")
+        if not na(newStp)
+            // step the stop line: the old level ends here, the new one starts on this candle
+            line.new(bar_index, stp, bar_index, newStp, color = color.new(cRed, 40), width = 1, style = line.style_dotted)
+            lStop := line.new(bar_index, newStp, bar_index + 1, newStp, color = cRed, width = 2)
+    if not na(newStp)
+        stp := newStp
+
+if not na(exitPx)
+    [r, p, why] = closeTrade(exitPx, exitWhy)
+    nT += 1
+    sumR += r
+    pts += p
+    eqR += r
+    peakR := math.max(peakR, eqR)
+    maxDD := math.max(maxDD, peakR - eqR)
+    isBE = math.abs(r) < 1e-9   // exactly 0R: neither a win nor a loss, streak unchanged
+    if isBE
+        nBE += 1
+    else if r > 0
+        nW += 1
+        grossW += r
+        consec := 0
+    else
+        grossL += -r
+        consec += 1
+        maxConsec := math.max(maxConsec, consec)
+    if showTrades
+        label.new(bar_index, pos == 1 ? high : low, (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R", style = pos == 1 ? label.style_label_down : label.style_label_up, color = color.new(isBE ? cGrey : r > 0 ? cGreen : cRed, 15), textcolor = color.black, size = size.tiny)
+    pos := 0
+    needReset := true
+    lStop := na
+    rBox := na
+    gBox := na
+
+// ───────────── Breaks & entries ─────────────
+inside = orDone and close <= orH and close >= orL
+if needReset and inside
+    needReset := false
+
+canEnter = okTF and orDone and pos == 0 and pend == 0 and blockEnd and mClose >= startM and mClose <= lastM and tradesToday < maxTradesI and not needReset
+brokeUp = orDone and blockEnd and close > orH
+brokeDn = orDone and blockEnd and close < orL
+// direction detection is separate from entry eligibility (see "First break counted from")
+firstBreak = dayDir == 0 and (brokeUp or brokeDn) and mClose >= detM
+if firstBreak
+    nBreakDays += 1
+// fresh break: the previous confirmation candle closed inside the range
+wasInside = not na(prevBC) and prevBC <= orH and prevBC >= orL
+freshOK = freshOnly == "Any close beyond the range" or wasInside
+int sig = 0
+if canEnter and freshOK and brokeUp and (dayDir == 0 or dayDir == 1 or dirMode == "Either side (each break)")
+    sig := 1
+if canEnter and freshOK and brokeDn and (dayDir == 0 or dayDir == -1 or dirMode == "Either side (each break)")
+    sig := -1
+if firstBreak
+    dayDir := brokeUp ? 1 : -1
+if blockEnd and (inOR or orDone)
+    prevBC := close
+
+if sig != 0
+    s = stopMode == "Other side of the range" ? (sig == 1 ? orL : orH) : stopMode == "Range midpoint" ? (orH + orL) / 2 : (sig == 1 ? bL : bH)
+    tradesToday += 1
+    if nextOpen
+        pend := sig               // filled at the next candle's open
+        pendStop := s
+    else
+        e = sig == 1 ? close + slipPts : close - slipPts
+        rk = openTrade(sig, e, s)
+        if not na(rk)
+            pos := sig
+            ent := e
+            stp := s
+            risk := rk
+            entBar := bar_index
+            tgt := exitMode == "Trail swings (his)" ? na : (sig == 1 ? e + rr * rk : e - rr * rk)
+            best := e
+            stop0 := s
+            if showTrades
+                [ls2, rb2, gb2] = drawEntry(sig, e, s, tgt)
+                lStop := ls2
+                rBox := rb2
+                gBox := gb2
+
+// range levels after the range candle closes
+plot(orDone and mOpen < flatM ? orH : na, "OR high", color = color.new(cGreen, 30), style = plot.style_linebr, linewidth = 1)
+plot(orDone and mOpen < flatM ? orL : na, "OR low", color = color.new(cRed, 30), style = plot.style_linebr, linewidth = 1)
+
+// ───────────── Results panel ─────────────
+var table pnl = table.new(position.top_right, 2, 15, bgcolor = color.new(cPanel, 8), border_color = color.new(cGrey, 60), border_width = 1)
+if showPanel and barstate.islast
+    wr = nT > 0 ? 100.0 * nW / nT : 0.0
+    pf = grossL > 0 ? grossW / grossL : na
+    table.cell(pnl, 0, 0, "BTH · Patrick 15m ORB", text_color = cGreen, text_size = size.small)
+    table.cell(pnl, 1, 0, okTF ? "1M ✓" : "SWITCH TO 1-MINUTE CHART", text_color = okTF ? cGreen : cRed, text_size = size.small)
+    table.cell(pnl, 0, 1, "Break by · direction", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 1, (blockN == 1 ? "1m close" : str.tostring(blockN) + "m close") + (freshOnly == "Fresh break only" ? " · fresh" : " · any") + " · " + (dirMode == "Locked by the first break" ? (dirFrom == "First break after the range" ? "locked at range" : "locked at entry time") : "either"), text_color = cAmber, text_size = size.small)
+    table.cell(pnl, 0, 2, "Stop · exit", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 2, (stopMode == "Breakout candle extreme (his)" ? "candle" : stopMode == "Other side of the range" ? "range side" : "midpoint") + " · " + (exitMode == "Trail swings (his)" ? "trail" : exitMode == "Fixed R:R" ? str.tostring(rr) + "R" : "trail+" + str.tostring(rr) + "R"), text_color = cAmber, text_size = size.small)
+    table.cell(pnl, 0, 3, "LOADED HISTORY", text_color = cGreen, text_size = size.small)
+    table.cell(pnl, 1, 3, str.tostring(nDays) + " days", text_color = nDays < 20 ? cRed : cWhite, text_size = size.small)
+    table.cell(pnl, 0, 4, "Days the range broke", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 4, str.tostring(nBreakDays), text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 5, "Trades", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 5, str.tostring(nT) + (nBE > 0 ? "  (" + str.tostring(nBE) + " break-even)" : ""), text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 6, "Win rate", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 6, str.tostring(wr, "#.#") + "%", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 7, "Total (R)", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 7, str.tostring(sumR, "#.##") + "R", text_color = sumR >= 0 ? cGreen : cRed, text_size = size.small)
+    table.cell(pnl, 0, 8, "Average per trade", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 8, nT > 0 ? str.tostring(sumR / nT, "#.###") + "R" : "—", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 9, "Profit factor", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 9, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 10, "Total points", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 10, str.tostring(pts, "#.#"), text_color = pts >= 0 ? cGreen : cRed, text_size = size.small)
+    table.cell(pnl, 0, 11, "Max drawdown (R)", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 11, str.tostring(maxDD, "#.##") + "R", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 12, "Worst losing streak", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 12, str.tostring(maxConsec), text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 13, "Fills · costs (points)", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 1, 13, (nextOpen ? "next open" : "candle close") + " · slip " + str.tostring(slipPts) + " · cost " + str.tostring(commPts), text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 0, 14, "Visual check", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 1, 14, "MT5 EA = final numbers", text_color = cGrey, text_size = size.tiny)

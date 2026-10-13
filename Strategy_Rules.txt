@@ -1,0 +1,88 @@
+PATRICK WIELAND'S 15-MINUTE OPENING RANGE STRATEGY
+The exact rules we coded, in plain English. Coded and backtested by Backtest the Hype.
+(The strategy idea belongs to Patrick Wieland. Not financial advice.)
+
+=====================================================================
+HIS RULES (from his video)
+=====================================================================
+1. THE BOX
+   At 9:30 New York time the market opens. Mark the HIGH and the LOW of the
+   first 15-minute candle (9:30 to 9:45). That is the opening range.
+
+2. DO NOTHING INSIDE THE BOX
+   No trade until that 15-minute candle has closed, and no trade while price
+   is still inside the range.
+
+3. THE BREAKOUT DECIDES THE DAY
+   Price breaks ABOVE the high  -> only look for LONGS today.
+   Price breaks BELOW the low   -> only look for SHORTS today.
+
+4. ENTRY
+   Enter in the breakout direction on the lower timeframe (1 to 5-minute chart).
+
+5. STOP LOSS
+   On the other end of the candle you enter on:
+   longs = that candle's low, shorts = that candle's high.
+   Size the position so this stop = your fixed risk.
+
+6. NO FIXED TARGET
+   Trail the stop behind each new higher low (longs) or lower high (shorts)
+   and let the move run until the stop is hit.
+
+7. NEWS
+   If economic numbers come out at 9:45 or 10:00, wait for them first.
+
+=====================================================================
+OUR DEFINITIONS (how we made it exact - NOT his words, all are settings)
+=====================================================================
+- Breakout: a 1-minute candle CLOSES outside the box. A wick doesn't count.
+- Fresh break only: the candle before closed inside the box, this one closes outside.
+- Entry: at the open of the next candle, at the real bid/ask.
+- Stop: the breakout candle's opposite extreme, no buffer.
+- Trailing stop: each new confirmed swing (2 candles on each side; ties don't
+  count). The stop only ever moves in the trade's favour.
+- Direction for the day: locked by the first break after the box closes.
+- Entry window: 9:45 to 12:00 New York. Every trade closed by 15:55 New York.
+- One trade at a time, max 1 trade per day. A re-entry needs price to close
+  back inside the box first.
+- News: tested as "earliest entry = 10:00" (the MT5 news calendar does not work
+  in the Strategy Tester). This is our delay test, not his exact news rule.
+- 1R = the amount lost if the first stop is hit.
+
+=====================================================================
+THE 7 VERSIONS WE TESTED (each changes ONE thing from V1)
+=====================================================================
+V1  His rules (trail, breakout-candle stop, 1-minute close, from 9:45)
+V2  Fixed 2R target
+V3  Fixed 3R target
+V4  Trail, capped at 2R
+V5  Classic ORB stop (other side of the box)
+V6  Breakout confirmed on a 5-minute candle close
+V7  Wait until 10:00 every day
+
+=====================================================================
+THE TEST
+=====================================================================
+Markets: NAS100, US500 (S&P 500), US30 (Dow) - Fusion Markets CFDs
+Data: real ticks, January 2021 to October 2026
+Costs: real spread + commission
+Risk: $1,000 per trade = 1R
+Size: 21 backtests, 28,703 simulated trades
+
+HIS EXACT RULES (V1):  NAS100 +17.6R | US500 +26.9R | US30 +85.7R
+All three together: +130.2R (+130% at 1% risk per trade, no compounding)
+
+Best result:   V1 on the Dow, +85.7R
+Best balance:  V6 (5-minute close) on the Dow, +75.8R, max drawdown 28.7R
+Smoothest:     V5 (range stop) on the Dow, max drawdown 14.2R
+
+THE 3 MISTAKES THAT BREAK IT
+1. Taking profit early - fixed targets lost 80-90R on the Nasdaq.
+2. Waiting for the open to settle - the 10:00 delay was the worst version on
+   every market (-229.1R combined).
+3. Skipping days - on the Nasdaq, his 5 best days made +73.5R. Without them the
+   other 1,384 trades lost 55.9R. You can't predict which mornings those are.
+
+PROP FIRM CHECK (1% risk, pass +8%, fail -10%, restart each time)
+NAS100 his rules: 23 passes, 24 fails - close to a coin flip.
+US30 range stop: 3 passes, 0 fails - but about 515 days per pass.
